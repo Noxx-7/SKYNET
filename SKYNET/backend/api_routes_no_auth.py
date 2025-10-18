@@ -10,6 +10,7 @@ import os
 from cryptography.fernet import Fernet
 
 from database import SessionLocal
+from supabase_client import get_supabase_client
 from models import (
     User, Model, TestRun, CollaborationSession, APIKey,
     CodeSession, PromptTemplate, ModelBenchmark,
@@ -192,6 +193,59 @@ async def get_api_keys(db: Session = Depends(get_db)):
 async def get_available_models():
     """Get list of available LLM models"""
     return ModelRegistry.get_available_models()
+
+@llm_router.post("/check-model-health")
+async def check_model_health(
+    request: Dict[str, str],
+    db: Session = Depends(get_db)
+):
+    """Check if a specific model is available and working"""
+    provider_name = request.get("provider")
+    model_id = request.get("model_id")
+
+    if not provider_name or not model_id:
+        raise HTTPException(status_code=400, detail="Provider and model_id are required")
+
+    api_key_obj = db.query(APIKey).filter(
+        APIKey.user_id == DEFAULT_USER_ID,
+        APIKey.provider == provider_name,
+        APIKey.is_active == True
+    ).first()
+
+    if not api_key_obj:
+        return {
+            "success": False,
+            "available": False,
+            "error": f"API key not configured for {provider_name}"
+        }
+
+    try:
+        provider_enum_map = {
+            "openai": ModelProvider.OPENAI,
+            "anthropic": ModelProvider.ANTHROPIC,
+            "gemini": ModelProvider.GEMINI
+        }
+        provider_enum = provider_enum_map.get(provider_name)
+
+        if not provider_enum:
+            return {
+                "success": False,
+                "available": False,
+                "error": f"Unsupported provider: {provider_name}"
+            }
+
+        decrypted_key = cipher_suite.decrypt(api_key_obj.encrypted_key.encode()).decode()
+        provider = LLMProviderFactory.create_provider(provider_enum, decrypted_key)
+
+        result = await provider.health_check(model_id)
+        return result
+
+    except Exception as e:
+        return {
+            "success": False,
+            "available": False,
+            "error": str(e)
+        }
 
 @llm_router.post("/generate", response_model=LLMGenerateResponse)
 async def generate_llm_response(
@@ -664,115 +718,111 @@ async def create_chat_history(
     chat_data: ChatHistoryCreate,
     db: Session = Depends(get_db)
 ):
-    """Create or update chat history - No auth required"""
-    existing_chat = db.query(ChatHistory).filter(
-        ChatHistory.user_id == DEFAULT_USER_ID,
-        ChatHistory.session_id == chat_data.session_id
-    ).first()
+    """Create or update chat history using Supabase - No auth required"""
+    try:
+        supabase = get_supabase_client()
 
-    if existing_chat:
-        existing_chat.messages = chat_data.messages
-        existing_chat.model_name = chat_data.model_name
-        if chat_data.title:
-            existing_chat.title = chat_data.title
-        existing_chat.updated_at = datetime.utcnow()
-        db.commit()
-        db.refresh(existing_chat)
+        # Check if chat already exists
+        existing = supabase.table("chat_history").select("*").eq("session_id", chat_data.session_id).eq("user_id", DEFAULT_USER_ID).maybeSingle().execute()
+
+        chat_data_dict = {
+            "user_id": DEFAULT_USER_ID,
+            "session_id": chat_data.session_id,
+            "model_id": chat_data.model_id,
+            "model_name": chat_data.model_name,
+            "messages": chat_data.messages,
+            "title": chat_data.title or f"Chat with {chat_data.model_name}",
+            "updated_at": datetime.utcnow().isoformat()
+        }
+
+        if existing.data:
+            # Update existing chat
+            result = supabase.table("chat_history").update(chat_data_dict).eq("session_id", chat_data.session_id).eq("user_id", DEFAULT_USER_ID).execute()
+            chat = result.data[0]
+        else:
+            # Create new chat
+            result = supabase.table("chat_history").insert(chat_data_dict).execute()
+            chat = result.data[0]
+
         return ChatHistoryResponse(
-            id=existing_chat.id,
-            user_id=existing_chat.user_id,
-            session_id=existing_chat.session_id,
-            model_id=existing_chat.model_id,
-            model_name=existing_chat.model_name,
-            messages=existing_chat.messages,
-            title=existing_chat.title,
-            created_at=existing_chat.created_at,
-            updated_at=existing_chat.updated_at
+            id=chat["id"],
+            user_id=chat["user_id"],
+            session_id=chat["session_id"],
+            model_id=chat.get("model_id"),
+            model_name=chat["model_name"],
+            messages=chat["messages"],
+            title=chat.get("title"),
+            created_at=datetime.fromisoformat(chat["created_at"].replace("Z", "+00:00")),
+            updated_at=datetime.fromisoformat(chat["updated_at"].replace("Z", "+00:00")) if chat.get("updated_at") else None
         )
-
-    chat_history = ChatHistory(
-        user_id=DEFAULT_USER_ID,
-        session_id=chat_data.session_id,
-        model_id=chat_data.model_id,
-        model_name=chat_data.model_name,
-        messages=chat_data.messages,
-        title=chat_data.title or f"Chat with {chat_data.model_name}"
-    )
-    db.add(chat_history)
-    db.commit()
-    db.refresh(chat_history)
-
-    return ChatHistoryResponse(
-        id=chat_history.id,
-        user_id=chat_history.user_id,
-        session_id=chat_history.session_id,
-        model_id=chat_history.model_id,
-        model_name=chat_history.model_name,
-        messages=chat_history.messages,
-        title=chat_history.title,
-        created_at=chat_history.created_at,
-        updated_at=chat_history.updated_at
-    )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error saving chat history: {str(e)}")
 
 @chat_history_router.get("/chat-history", response_model=List[ChatHistoryResponse])
 async def get_chat_history(db: Session = Depends(get_db)):
-    """Get all chat history - No auth required"""
-    chats = db.query(ChatHistory).filter(
-        ChatHistory.user_id == DEFAULT_USER_ID
-    ).order_by(ChatHistory.updated_at.desc()).limit(50).all()
+    """Get all chat history using Supabase - No auth required"""
+    try:
+        supabase = get_supabase_client()
+        result = supabase.table("chat_history").select("*").eq("user_id", DEFAULT_USER_ID).order("updated_at", desc=True).limit(50).execute()
 
-    return [
-        ChatHistoryResponse(
-            id=chat.id,
-            user_id=chat.user_id,
-            session_id=chat.session_id,
-            model_id=chat.model_id,
-            model_name=chat.model_name,
-            messages=chat.messages,
-            title=chat.title,
-            created_at=chat.created_at,
-            updated_at=chat.updated_at
-        ) for chat in chats
-    ]
+        return [
+            ChatHistoryResponse(
+                id=chat["id"],
+                user_id=chat["user_id"],
+                session_id=chat["session_id"],
+                model_id=chat.get("model_id"),
+                model_name=chat["model_name"],
+                messages=chat["messages"],
+                title=chat.get("title"),
+                created_at=datetime.fromisoformat(chat["created_at"].replace("Z", "+00:00")),
+                updated_at=datetime.fromisoformat(chat["updated_at"].replace("Z", "+00:00")) if chat.get("updated_at") else None
+            ) for chat in result.data
+        ]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error fetching chat history: {str(e)}")
 
 @chat_history_router.get("/chat-history/{session_id}", response_model=ChatHistoryResponse)
 async def get_chat_by_session(session_id: str, db: Session = Depends(get_db)):
-    """Get chat history by session ID - No auth required"""
-    chat = db.query(ChatHistory).filter(
-        ChatHistory.user_id == DEFAULT_USER_ID,
-        ChatHistory.session_id == session_id
-    ).first()
+    """Get chat history by session ID using Supabase - No auth required"""
+    try:
+        supabase = get_supabase_client()
+        result = supabase.table("chat_history").select("*").eq("session_id", session_id).eq("user_id", DEFAULT_USER_ID).maybeSingle().execute()
 
-    if not chat:
-        raise HTTPException(status_code=404, detail="Chat history not found")
+        if not result.data:
+            raise HTTPException(status_code=404, detail="Chat history not found")
 
-    return ChatHistoryResponse(
-        id=chat.id,
-        user_id=chat.user_id,
-        session_id=chat.session_id,
-        model_id=chat.model_id,
-        model_name=chat.model_name,
-        messages=chat.messages,
-        title=chat.title,
-        created_at=chat.created_at,
-        updated_at=chat.updated_at
-    )
+        chat = result.data
+        return ChatHistoryResponse(
+            id=chat["id"],
+            user_id=chat["user_id"],
+            session_id=chat["session_id"],
+            model_id=chat.get("model_id"),
+            model_name=chat["model_name"],
+            messages=chat["messages"],
+            title=chat.get("title"),
+            created_at=datetime.fromisoformat(chat["created_at"].replace("Z", "+00:00")),
+            updated_at=datetime.fromisoformat(chat["updated_at"].replace("Z", "+00:00")) if chat.get("updated_at") else None
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error fetching chat history: {str(e)}")
 
 @chat_history_router.delete("/chat-history/{session_id}")
 async def delete_chat_history(session_id: str, db: Session = Depends(get_db)):
-    """Delete chat history by session ID - No auth required"""
-    chat = db.query(ChatHistory).filter(
-        ChatHistory.user_id == DEFAULT_USER_ID,
-        ChatHistory.session_id == session_id
-    ).first()
+    """Delete chat history by session ID using Supabase - No auth required"""
+    try:
+        supabase = get_supabase_client()
+        result = supabase.table("chat_history").delete().eq("session_id", session_id).eq("user_id", DEFAULT_USER_ID).execute()
 
-    if not chat:
-        raise HTTPException(status_code=404, detail="Chat history not found")
+        if not result.data:
+            raise HTTPException(status_code=404, detail="Chat history not found")
 
-    db.delete(chat)
-    db.commit()
-
-    return {"success": True, "message": "Chat history deleted"}
+        return {"success": True, "message": "Chat history deleted"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error deleting chat history: {str(e)}")
 
 # ============= Code Optimization Routes =============
 

@@ -17,18 +17,39 @@ class ModelProvider(Enum):
 
 class LLMProvider(ABC):
     """Abstract base class for LLM providers"""
-    
+
     @abstractmethod
     async def generate(self, prompt: str, **kwargs) -> Dict[str, Any]:
         pass
-    
+
     @abstractmethod
     async def stream_generate(self, prompt: str, **kwargs):
         pass
-    
+
     @abstractmethod
     def validate_api_key(self) -> bool:
         pass
+
+    async def health_check(self, model: str) -> Dict[str, Any]:
+        """Check if the model is accessible and working"""
+        try:
+            response = await self.generate(
+                prompt="Hello",
+                model=model,
+                max_tokens=10,
+                temperature=0.1
+            )
+            return {
+                "success": response.get("success", True),
+                "available": response.get("success", True),
+                "error": response.get("error")
+            }
+        except Exception as e:
+            return {
+                "success": False,
+                "available": False,
+                "error": str(e)
+            }
 
 class OpenAIProvider(LLMProvider):
     def __init__(self, api_key: str):
@@ -333,9 +354,6 @@ class ModelRegistry:
         },
         ModelProvider.GEMINI: {
             "gemini-2.0-flash-exp": {"name": "Gemini 2.0 Flash Exp", "context": 1000000, "vision": True},
-            "gemini-1.5-pro": {"name": "Gemini 1.5 Pro", "context": 2000000, "vision": True},
-            "gemini-1.5-flash": {"name": "Gemini 1.5 Flash", "context": 1000000, "vision": True},
-            "gemini-1.5-flash-8b": {"name": "Gemini 1.5 Flash-8B", "context": 1000000, "vision": True},
         }
     }
     
